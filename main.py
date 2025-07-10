@@ -1,4 +1,9 @@
 import os
+import platform
+try:
+    import win32com.client # type: ignore
+except ImportError:
+    win32com = None
 from tkinter import (
     Tk, Button, Label, filedialog, Listbox, END,
     Checkbutton, BooleanVar, Toplevel, messagebox,
@@ -7,13 +12,44 @@ from tkinter import (
 from PIL import Image, ImageTk
 import imagehash
 import shutil
+import threading
+import queue
+
+
+# Defining and grouping image file extension tuples
+RASTER_EXTS = (
+    '.png', '.apng', '.jpg', '.jpeg', '.jpe', '.jfif', '.pjpeg', '.pjp',
+    '.bmp', '.dib', '.gif', '.tiff', '.tif', '.webp', '.heif', '.heic',
+    '.avif', '.jp2', '.j2k', '.jpf', '.jpx', '.jpm', '.mj2', '.jxr', '.hdp',
+    '.wdp', '.exr', '.hdr', '.psd', '.psb', '.ico', '.cur', '.xbm', '.xpm',
+    '.pcx', '.tga', '.dds', '.ras', '.sgi', '.rgb', '.rgba', '.pic', '.pct',
+    '.mng', '.jng', '.bpg', '.flif', '.qoi', '.pam', '.pbm', '.pgm', '.ppm', '.pnm',
+)
+VECTOR_EXTS = (
+    '.svg', '.svgz', '.eps', '.ps', '.ai', '.pdf', '.cdr', '.wmf', '.emf',
+    '.dxf', '.cgm', '.vml',
+)
+RAW_EXTS = (
+    '.3fr', '.ari', '.arw', '.srf', '.sr2', '.bay', '.braw', '.cri',
+    '.crw', '.cr2', '.cr3', '.cap', '.iiq', '.eip', '.dcs', '.dcr',
+    '.drf', '.k25', '.kdc', '.dng', '.erf', '.fff', '.gpr', '.mef',
+    '.mdc', '.mos', '.mrw', '.nef', '.nrw', '.orf', '.pef', '.ptx',
+    '.pxn', '.r3d', '.raf', '.raw', '.rw2', '.rwl', '.rwz', '.srw',
+    '.tco', '.x3f',
+)
+ALL_IMAGE_EXTS = RASTER_EXTS + VECTOR_EXTS + RAW_EXTS
+
 
 class DuplicateImageFinder:
     def __init__(self, root):
 
+        self.scan_queue = queue.Queue()
+
         self.duplicate_pairs = []
         self.deletion_vars = []
         self.deletion_paths = []
+        self.last_folder = None
+        self.duplicate_groups = []
 
         self.root = root
         self.root.title("Duplicate Image Finder")
@@ -79,59 +115,153 @@ class DuplicateImageFinder:
         )
         self.empty_button.pack(pady=5)
 
+        # Progress tracker
+        self.progress_label = Label(root, text="")
+        self.progress_label.pack(pady=5)
+
 
     def select_folder(self):
-        folder_path = filedialog.askdirectory()
-        if folder_path:
-            self.find_duplicates(folder_path)
+        system = platform.system()
 
-
-    def find_duplicates(self, folder_path):
-        self.result_list.delete(0, END)
-        hashes = {}
-        duplicates = []
-
-        for root, _, files in os.walk(folder_path):
-            for file in files:
-                if file.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif')):
-                    path = os.path.join(root, file)
-                    try:
-                        img = Image.open(path)
-                        hash_val = imagehash.phash(img)
-                        if hash_val in hashes:
-                            duplicates.append((path, hashes[hash_val]))
-                        else:
-                            hashes[hash_val] = path
-                    except Exception as e:
-                        self.result_list.insert(END, f"Error: {file} ({str(e)})")
-
-        self.duplicate_pairs = duplicates
-
-        if duplicates:
-            self.preview_button.config(state='normal')
+        # Always start with the parent of the previous pick
+        if self.last_folder:
+            start_dir = os.path.dirname(self.last_folder)
         else:
-            self.preview_button.config(state='disabled')
+            # If no prior pick is stored, default to the drive directory folder, or root, depending on the OS
+            if system == "Windows" and win32com:
+                start_dir = None
+            elif system == "Darwin":
+                start_dir = os.path.expanduser("~")
+            else:
+                start_dir = os.path.abspath(os.sep)
 
-        if duplicates and self.log_var.get():
+        # Starting at “This PC” dialog in Windows
+        if system == "Windows" and win32com and self.last_folder is None:
+            try:
+                shell = win32com.client.Dispatch("Shell.Application")
+                browse = shell.BrowseForFolder(0, "Select Folder", 0, 17)
+                folder_path = browse.Self.Path if browse else None
+            except Exception:
+                folder_path = filedialog.askdirectory()
+        else:
+            # Non-Windows or after first pick on Windows
+            folder_path = filedialog.askdirectory(initialdir=start_dir)
+
+        if folder_path:
+            self.last_folder = folder_path
+            
+            self.select_button.config(state='disabled')
+            self.preview_button.config(state='disabled')
+            self.result_list.delete(0, END)
+            self.progress_label.config(text="Scanning... 0% complete")
+
+            self.deletion_vars.clear()
+            self.deletion_paths.clear()
+
+            # Start the worker thread
+            thread = threading.Thread(
+                target=self._scan_thread,
+                args=(folder_path,),
+                daemon=True
+            )
+            thread.start()
+
+            # Begin polling the queue every 100 ms
+            self.root.after(100, self._process_scan_queue)
+
+
+    def _scan_thread(self, folder_path):
+        # Gather all image paths
+        image_paths = []
+        for dirpath, _, files in os.walk(folder_path):
+            for file in files:
+                if file.lower().endswith(ALL_IMAGE_EXTS):
+                    image_paths.append(os.path.join(dirpath, file))
+        total = len(image_paths)
+
+        # If nothing to do, send done immediately
+        if total == 0:
+            self.scan_queue.put(('done', []))
+            return
+
+        hashes = {}
+        for idx, path in enumerate(image_paths, start=1):
+            filename = os.path.basename(path)
+            try:
+                img = Image.open(path)
+                h = imagehash.phash(img)
+                hashes.setdefault(h, []).append(path)
+            except Exception as e:
+                self.scan_queue.put(('error', filename, str(e)))
+            # Progress update
+            pct = int(idx/total*100)
+            self.scan_queue.put(('progress', pct))
+
+        # Retreive groups with more than one image
+        self.duplicate_groups = [grp for grp in hashes.values() if len(grp) > 1]
+
+        # Scanning done, send duplicates list
+        self.scan_queue.put(('done', self.duplicate_groups))
+
+
+    def _process_scan_queue(self):
+        try:
+            while True:
+                msg = self.scan_queue.get_nowait()
+                tag = msg[0]
+
+                if tag == 'progress':
+                    _, pct = msg
+                    self.progress_label.config(text=f"Scanning... {pct}% complete")
+
+                elif tag == 'error':
+                    _, filename, error = msg
+                    self.result_list.insert(END, f"Error: {filename} ({error})")
+
+                elif tag == 'done':
+                    _, duplicates = msg
+                    # Hand off to completion handler
+                    self._on_scan_complete(duplicates)
+                    return  # stop processing after 'done'
+        except queue.Empty:
+            # No more messages right now
+            pass
+
+        # If not 'done' yet, poll again
+        self.root.after(100, self._process_scan_queue)
+
+
+    def _on_scan_complete(self, groups):
+        self.progress_label.config(text="Scan complete.")
+        self.select_button.config(state='normal')
+
+        # Optional log
+        if groups and self.log_var.get():
             log_file = os.path.join(os.getcwd(), 'duplicate_log.txt')
             try:
                 with open(log_file, 'w') as f:
-                    f.write('Duplicate pairs found:\n')
-                    for dup in duplicates:
-                        f.write(f"{dup[0]}, {dup[1]}\n")
+                    f.write('Duplicate groups:\n')
+                    for grp in groups:
+                        f.write(", ".join(grp) + "\n")
                 self.result_list.insert(END, f"Log file created at {log_file}")
             except Exception as e:
                 self.result_list.insert(END, f"Error writing log file: {e}")
 
-        if duplicates:
-            for dup in duplicates:
-                self.result_list.insert(END, f"Duplicate Found:\n  {dup[0]}\n  {dup[1]}\n")
+        # Show results & enable preview if needed
+        if groups:
+            for grp in groups:
+                # Show first two paths in the preview list
+                self.result_list.insert(
+                    END,
+                    "Duplicate Group:\n  " + "\n  ".join(grp) + "\n"
+                )
+            self.preview_button.config(state='normal')
         else:
             self.result_list.insert(END, "No duplicates found.")
 
 
     def show_preview_window(self):
-        if not self.duplicate_pairs:
+        if not self.duplicate_groups:
             return
 
         preview = Toplevel(self.root)
@@ -161,32 +291,39 @@ class DuplicateImageFinder:
             canvas.configure(scrollregion=canvas.bbox("all"))
         inner.bind("<Configure>", on_inner_config)
 
+        # Reset deletion tracking
+        self.deletion_vars.clear()
+        self.deletion_paths.clear()
+
         # Build each pair frame (but don’t grid yet)
         pair_frames = []
-        for path1, path2 in self.duplicate_pairs:
+        for group in self.duplicate_groups:
             pf = Frame(inner, relief="groove", borderwidth=2, padx=5, pady=5)
 
-            # Load thumbnails
-            img1 = Image.open(path1); img1.thumbnail((100, 100))
-            img2 = Image.open(path2); img2.thumbnail((100, 100))
-            photo1 = ImageTk.PhotoImage(img1)
-            photo2 = ImageTk.PhotoImage(img2)
+            for idx, path in enumerate(group):
+                # Load and thumbnail the image
+                img = Image.open(path)
+                img.thumbnail((100, 100))
+                photo = ImageTk.PhotoImage(img)
 
-            # Place images side-by-side
-            lbl1 = Label(pf, image=photo1); lbl1.image = photo1
-            lbl2 = Label(pf, image=photo2); lbl2.image = photo2
-            lbl1.grid(row=0, column=0, padx=5, pady=5)
-            lbl2.grid(row=0, column=1, padx=5, pady=5)
+                # Place the image
+                lbl = Label(pf, image=photo)
+                lbl.image = photo  # keep a reference!
+                lbl.grid(row=0, column=idx, padx=5, pady=5)
 
-            # Checkboxes directly under each image
-            var1 = BooleanVar(value=False)
-            var2 = BooleanVar(value=False)
-            cb1 = Checkbutton(pf, variable=var1); cb1.grid(row=1, column=0, pady=(0,5))
-            cb2 = Checkbutton(pf, variable=var2); cb2.grid(row=1, column=1, pady=(0,5))
+                # First image is protected: disabled checkbox
+                if idx == 0:
+                    cb = Checkbutton(pf, state='disabled')
+                    cb.grid(row=1, column=idx, pady=(0, 5))
+                else:
+                    # True duplicates get a real checkbox
+                    var = BooleanVar(value=False)
+                    cb = Checkbutton(pf, variable=var)
+                    cb.grid(row=1, column=idx, pady=(0, 5))
 
-            # Track for deletion logic
-            self.deletion_vars.extend([var1, var2])
-            self.deletion_paths.extend([path1, path2])
+                    # Track for deletion
+                    self.deletion_vars.append(var)
+                    self.deletion_paths.append(path)
 
             pair_frames.append(pf)
 
@@ -212,19 +349,13 @@ class DuplicateImageFinder:
 
 
     def _select_all(self):
-        # Loop over all checkbox variables by index, unchecking the first and checking the second image in each pair for a quick removal of duplicates
-        for idx, var in enumerate(self.deletion_vars):
-            if idx % 2 == 1:
-                var.set(True)
-            else:
-                var.set(False)
+        for var in self.deletion_vars:
+            var.set(True)
 
 
     def _deselect_all(self):
-        # Like _select_all except only iterating to the odds and unchecking
-        for idx, var in enumerate(self.deletion_vars):
-            if idx % 2 == 1:
-                var.set(False)
+        for var in self.deletion_vars:
+            var.set(False)
 
 
     def _delete_selected(self):
